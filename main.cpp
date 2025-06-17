@@ -8,10 +8,11 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <vector>
-#include <algorithm> // Dla std::transform
-#include <cctype>    // Dla std::tolower
+#include <algorithm>
+#include <cctype>
 #include <netfw.h>
 #include <oleauto.h>
+#include <fstream> // Do logowania
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -24,16 +25,22 @@
 using namespace Gdiplus;
 using namespace std;
 
-// --- Konfiguracja ---
+// --- GŁÓWNA KONFIGURACJA ---
 const string MASTER_PASSWORD = "haslo123";
 const int MAX_FAILED_ATTEMPTS = 3;
-const int WALLPAPER_RESOURCE_ID = 101; // ID zasobu obrazu w pliku .rc
-const wchar_t* FIREWALL_RULE_NAME = L"SecureAppBlockNetwork";
+const int WALLPAPER_RESOURCE_ID = 101;
+// OPCJA AGRESYWNA: true = wyłącza pulpit, pasek zadań i menu Start.
+const bool BLOCK_DESKTOP_SHELL = true;
 
-// Lista procesów do zablokowania (małymi literami)
+
+// --- Konfiguracja techniczna ---
+const wchar_t* FIREWALL_RULE_NAME = L"SecureAppBlockNetwork";
+const wchar_t* LOG_FILE_NAME = L"log.txt";
+
 const vector<wstring> g_blockedProcesses = {
     L"taskmgr.exe", L"procexp.exe", L"procexp64.exe", L"processhacker.exe",
-    L"chrome.exe", L"firefox.exe", L"msedge.exe", L"opera.exe", L"iexplore.exe", L"brave.exe"
+    L"chrome.exe", L"firefox.exe", L"msedge.exe", L"opera.exe", L"iexplore.exe", L"brave.exe",
+    L"cmd.exe", L"powershell.exe" // Blokada narzędzi wiersza poleceń
 };
 
 // --- Zmienne globalne ---
@@ -45,8 +52,6 @@ Image* g_backgroundImage = NULL;
 HHOOK g_hHook = NULL;
 int g_failedAttempts = 0;
 wstring g_tempWallpaperPath;
-
-// --- Zmienne dla GUI ---
 bool g_isMouseOverButton = false;
 bool g_isCursorVisible = true;
 RECT g_passwordRect;
@@ -54,11 +59,25 @@ RECT g_buttonRect;
 
 // --- Prototypy funkcji ---
 void RestoreSystemSettings();
-void KillProcessByName(const wstring& processName);
+void KillProcessByName(const wstring& processName, bool log);
 void SetExplorerPolicies();
 void MonitorAndKillProcesses(const vector<wstring>& processList);
 HRESULT ManageFirewallRule(bool block, bool& verificationResult);
 wstring ToLower(wstring str);
+void WriteToLog(const wstring& message);
+
+
+// --- Funkcja do logowania ---
+void WriteToLog(const wstring& message) {
+    wofstream logFile(LOG_FILE_NAME, ios_base::app);
+    if (logFile.is_open()) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t timeBuf[100];
+        swprintf(timeBuf, 100, L"[%04d-%02d-%02d %02d:%02d:%02d] ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        logFile << timeBuf << message << endl;
+    }
+}
 
 // --- Funkcja pomocnicza do konwersji na małe litery ---
 wstring ToLower(wstring str) {
@@ -66,13 +85,20 @@ wstring ToLower(wstring str) {
     return str;
 }
 
-// -------------------- Zapisz zasób do pliku tymczasowego --------------------
+
+// --- Zapisz zasób do pliku tymczasowego ---
 wstring SaveResourceToTempFile(HINSTANCE hInstance, int resourceId) {
     HRSRC hRes = FindResource(hInstance, MAKEINTRESOURCE(resourceId), RT_RCDATA);
-    if (!hRes) return L"";
+    if (!hRes) {
+        WriteToLog(L"ERROR: Could not find image resource.");
+        return L"";
+    }
     DWORD imageSize = SizeofResource(hInstance, hRes);
     HGLOBAL hMem = LoadResource(hInstance, hRes);
-    if (!hMem) return L"";
+    if (!hMem) {
+        WriteToLog(L"ERROR: Could not load image resource.");
+        return L"";
+    }
     void* pData = LockResource(hMem);
     if (!pData) return L"";
 
@@ -83,7 +109,10 @@ wstring SaveResourceToTempFile(HINSTANCE hInstance, int resourceId) {
     GetTempFileNameW(tempPath, L"WALL", 0, tempFileName);
 
     HANDLE hFile = CreateFileW(tempFileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return L"";
+    if (hFile == INVALID_HANDLE_VALUE) {
+        WriteToLog(L"ERROR: Could not create temp file for wallpaper.");
+        return L"";
+    }
 
     DWORD bytesWritten;
     WriteFile(hFile, pData, imageSize, &bytesWritten, NULL);
@@ -92,27 +121,28 @@ wstring SaveResourceToTempFile(HINSTANCE hInstance, int resourceId) {
     return wstring(tempFileName);
 }
 
-// -------------------- Ustaw tapetę pulpitu --------------------
+// --- Ustaw tapetę pulpitu ---
 void SetDesktopWallpaper(const wstring& path) {
     if (path.empty()) return;
     SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)path.c_str(), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
 }
 
-// -------------------- Ustaw politykę w rejestrze --------------------
+// --- Ustaw politykę w rejestrze ---
 void SetRegistryPolicy(const wstring& subKey, const wstring& valueName, DWORD data) {
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         RegSetValueExW(hKey, valueName.c_str(), 0, REG_DWORD, (const BYTE*)&data, sizeof(data));
         RegCloseKey(hKey);
+    } else {
+        WriteToLog(L"ERROR: Failed to create or open registry key: " + subKey);
     }
 }
 
-// -------------------- Ustaw polityki Eksploratora Windows --------------------
+// --- Ustaw polityki Eksploratora Windows ---
 void SetExplorerPolicies() {
     SetRegistryPolicy(L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\ActiveDesktop", L"NoChangingWallPaper", 1);
     SetRegistryPolicy(L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", L"NoFileDelete", 1);
 }
-
 
 // --- Zarządzanie regułą Zapory Windows z weryfikacją ---
 HRESULT ManageFirewallRule(bool create, bool& verificationSucceeded) {
@@ -167,7 +197,7 @@ cleanup:
 }
 
 
-// -------------------- Zarządzaj Narratorem --------------------
+// --- Zarządzaj Narratorem ---
 void ManageNarrator() {
     ShellExecute(NULL, L"open", L"narrator.exe", NULL, NULL, SW_SHOWNORMAL);
     while (g_running && !g_passwordEntered) {
@@ -195,7 +225,7 @@ void ManageNarrator() {
 }
 
 
-// -------------------- Dodaj strażnika --------------------
+// --- Dodaj strażnika ---
 void StartWatchdog() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileName(NULL, exePath, MAX_PATH);
@@ -203,6 +233,7 @@ void StartWatchdog() {
     while (g_running) {
         HWND hwnd = FindWindow(L"SecureMediaApp", NULL);
         if (!hwnd) {
+            WriteToLog(L"WATCHDOG: Main window not found! Restarting application.");
             ShellExecute(NULL, L"open", exePath, NULL, NULL, SW_SHOWNORMAL);
             this_thread::sleep_for(chrono::seconds(3));
         }
@@ -210,7 +241,7 @@ void StartWatchdog() {
     }
 }
 
-// -------------------- Ładuj obraz z zasobu --------------------
+// --- Ładuj obraz z zasobu ---
 Image* LoadImageFromResource(HINSTANCE hInstance, int resourceId) {
     HRSRC hRes = FindResource(hInstance, MAKEINTRESOURCE(resourceId), RT_RCDATA);
     if (!hRes) {
@@ -243,12 +274,12 @@ Image* LoadImageFromResource(HINSTANCE hInstance, int resourceId) {
     return img;
 }
 
-// -------------------- Dźwięk piknięcia --------------------
+// --- Dźwięk piknięcia ---
 void PlayEmbeddedSound() {
     Beep(3000, 500);
 }
 
-// -------------------- Hook blokujący klawisze --------------------
+// --- Hook blokujący klawisze ---
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
         KBDLLHOOKSTRUCT* pKbd = (KBDLLHOOKSTRUCT*)lParam;
@@ -257,13 +288,42 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             (pKbd->vkCode == VK_DELETE && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)) ||
             (pKbd->vkCode == VK_LWIN || pKbd->vkCode == VK_RWIN) ||
             (pKbd->vkCode == VK_F4 && (GetAsyncKeyState(VK_MENU) & 0x8000))) {
-            return 1; // Blokuj
+            return 1;
         }
     }
     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
 }
 
-// -------------------- Monitoruj i zabijaj procesy (ignoruje wielkość liter) --------------------
+
+// --- Zakończ proces o podanej nazwie z logowaniem ---
+void KillProcessByName(const wstring& processName, bool log) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(pe32);
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (ToLower(pe32.szExeFile) == ToLower(processName)) {
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                if (hProc) {
+                    if (TerminateProcess(hProc, 0)) {
+                        if (log) WriteToLog(L"SUCCESS: Terminated process '" + processName + L"'.");
+                    } else {
+                        if (log) WriteToLog(L"ERROR: Failed to terminate process '" + processName + L"'. GetLastError: " + to_wstring(GetLastError()));
+                    }
+                    CloseHandle(hProc);
+                } else {
+                     if (log) WriteToLog(L"ERROR: Failed to open process '" + processName + L"'. GetLastError: " + to_wstring(GetLastError()));
+                }
+                break;
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+}
+
+// --- Monitoruj i zabijaj procesy (agresywnie) ---
 void MonitorAndKillProcesses(const vector<wstring>& processList) {
     while (g_running && !g_passwordEntered) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -280,22 +340,20 @@ void MonitorAndKillProcesses(const vector<wstring>& processList) {
                 wstring procNameLower = ToLower(pe32.szExeFile);
                 for (const auto& blockedProc : processList) {
                     if (procNameLower == blockedProc) {
-                        HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-                        if (hProc) {
-                            TerminateProcess(hProc, 0);
-                            CloseHandle(hProc);
-                        }
+                        WriteToLog(L"INFO: Found blocked process '" + blockedProc + L"'. Attempting to terminate.");
+                        KillProcessByName(blockedProc, true);
                         break;
                     }
                 }
             } while (Process32Next(hSnapshot, &pe32));
         }
         CloseHandle(hSnapshot);
-        this_thread::sleep_for(chrono::milliseconds(200));
+        this_thread::sleep_for(chrono::milliseconds(50));
     }
 }
 
-// -------------------- Uprawnienia do zamknięcia systemu --------------------
+
+// --- Uprawnienia do zamknięcia systemu ---
 bool EnableShutdownPrivilege() {
     HANDLE hToken;
     TOKEN_PRIVILEGES tkp;
@@ -317,23 +375,27 @@ bool EnableShutdownPrivilege() {
     return (GetLastError() == ERROR_SUCCESS) && res;
 }
 
-// -------------------- Zamknij system --------------------
+// --- Zamknij system ---
 void ShutdownSystem() {
+    WriteToLog(L"WARN: Max failed attempts reached. Shutting down system.");
     if (!EnableShutdownPrivilege()) {
+        WriteToLog(L"FATAL: Could not get shutdown privilege!");
         MessageBox(NULL, L"Brak uprawnień do zamknięcia systemu!", L"Błąd", MB_ICONERROR);
         return;
     }
     if (!ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, SHTDN_REASON_MAJOR_OTHER)) {
+        WriteToLog(L"FATAL: ExitWindowsEx failed!");
         MessageBox(NULL, L"Nie udało się zamknąć systemu!", L"Błąd", MB_ICONERROR);
     }
 }
 
-// -------------------- Sprawdź hasło --------------------
+// --- Sprawdź hasło ---
 void CheckPassword() {
     if (g_currentPassword == MASTER_PASSWORD) {
         g_passwordEntered = true;
         g_running = false;
     } else {
+        WriteToLog(L"WARN: Incorrect password entered.");
         g_failedAttempts++;
         g_currentPassword.clear();
         InvalidateRect(g_hwnd, NULL, FALSE);
@@ -351,7 +413,7 @@ void CheckPassword() {
     }
 }
 
-// -------------------- Funkcja pomocnicza do rysowania zaokrąglonego prostokąta --------------------
+// --- Funkcja pomocnicza do rysowania zaokrąglonego prostokąta ---
 void DrawRoundedRectangle(Graphics& graphics, Pen* pen, Brush* brush, int x, int y, int width, int height, int radius) {
     GraphicsPath path;
     path.AddArc(x, y, radius * 2, radius * 2, 180, 90);
@@ -364,7 +426,7 @@ void DrawRoundedRectangle(Graphics& graphics, Pen* pen, Brush* brush, int x, int
     graphics.DrawPath(pen, &path);
 }
 
-// -------------------- Procedura okna --------------------
+// --- Procedura okna ---
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     static GdiplusStartupInput gdiplusStartupInput;
     static ULONG_PTR gdiplusToken;
@@ -514,7 +576,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-// -------------------- Dodaj zadanie do Harmonogramu zadań --------------------
+// --- Dodaj zadanie do Harmonogramu zadań ---
 void AddToTaskScheduler() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileName(NULL, exePath, MAX_PATH);
@@ -535,30 +597,9 @@ void AddToTaskScheduler() {
     _wsystem(createCmd.c_str());
 }
 
-// -------------------- Zakończ proces o podanej nazwie --------------------
-void KillProcessByName(const wstring& processName) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32 pe32;
-        pe32.dwSize = sizeof(pe32);
-        if (Process32First(hSnapshot, &pe32)) {
-            do {
-                if (ToLower(pe32.szExeFile) == ToLower(processName)) {
-                    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-                    if (hProc) {
-                        TerminateProcess(hProc, 0);
-                        CloseHandle(hProc);
-                        break;
-                    }
-                }
-            } while (Process32Next(hSnapshot, &pe32));
-        }
-        CloseHandle(hSnapshot);
-    }
-}
-
-// -------------------- Przywróć ustawienia systemowe --------------------
+// --- Przywróć ustawienia systemowe ---
 void RestoreSystemSettings() {
+    WriteToLog(L"INFO: Password correct. Restoring system settings.");
     HWND taskbar = FindWindow(L"Shell_TrayWnd", NULL);
     if (taskbar) ShowWindow(taskbar, SW_SHOW);
 
@@ -572,39 +613,65 @@ void RestoreSystemSettings() {
 
     bool verification;
     ManageFirewallRule(false, verification);
+    if(verification) WriteToLog(L"SUCCESS: Firewall rule removed.");
+    else WriteToLog(L"ERROR: Failed to remove firewall rule.");
 
-    KillProcessByName(L"narrator.exe");
+    KillProcessByName(L"narrator.exe", false);
 
     if (g_hHook) UnhookWindowsHookEx(g_hHook);
+
+    if (BLOCK_DESKTOP_SHELL) {
+        WriteToLog(L"INFO: Restarting desktop shell (explorer.exe).");
+        ShellExecute(NULL, L"open", L"explorer.exe", NULL, NULL, SW_SHOWNORMAL);
+    }
 }
 
-// -------------------- WinMain --------------------
+// --- WinMain: Główna funkcja programu ---
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    WriteToLog(L"=======================================");
+    WriteToLog(L"INFO: SecureApp starting up.");
+
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (FAILED(hr)) {
+        WriteToLog(L"FATAL: CoInitializeEx failed. HRESULT: " + to_wstring(hr));
         MessageBoxW(NULL, L"Błąd krytyczny: Nie można zainicjować COM.", L"Błąd", MB_ICONERROR);
         return -1;
     }
+    WriteToLog(L"SUCCESS: COM initialized.");
 
     this_thread::sleep_for(chrono::seconds(1));
 
     AddToTaskScheduler();
+    WriteToLog(L"INFO: Scheduled task configured.");
 
     g_tempWallpaperPath = SaveResourceToTempFile(hInstance, WALLPAPER_RESOURCE_ID);
     SetDesktopWallpaper(g_tempWallpaperPath);
+    WriteToLog(L"INFO: Wallpaper set.");
     SetExplorerPolicies();
+    WriteToLog(L"INFO: Registry policies applied (NoFileDelete, NoChangingWallPaper).");
+
+    if (BLOCK_DESKTOP_SHELL) {
+        WriteToLog(L"INFO: Aggressive mode enabled. Terminating desktop shell (explorer.exe).");
+        KillProcessByName(L"explorer.exe", true);
+    }
 
     bool firewallRuleSet;
     ManageFirewallRule(true, firewallRuleSet);
     if (!firewallRuleSet) {
-        MessageBoxW(NULL, L"Ostrzeżenie: Nie udało się zweryfikować reguły zapory. Dostęp do sieci może nie być zablokowany. Upewnij się, że usługa Zapora Windows Defender jest włączona.", L"Błąd Zapory", MB_ICONWARNING);
+        WriteToLog(L"ERROR: Failed to set and verify firewall rule. Network may not be blocked.");
+        MessageBoxW(NULL, L"Ostrzeżenie: Nie udało się zweryfikować reguły zapory. Dostęp do sieci może nie być zablokowany. Sprawdź plik log.txt i ustawienia antywirusa.", L"Błąd Zapory", MB_ICONWARNING);
+    } else {
+        WriteToLog(L"SUCCESS: Firewall rule set and verified.");
     }
 
     g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+    if (g_hHook) WriteToLog(L"SUCCESS: Keyboard hook installed.");
+    else WriteToLog(L"ERROR: Failed to install keyboard hook.");
 
     thread processMonitor(MonitorAndKillProcesses, g_blockedProcesses);
     thread narratorManager(ManageNarrator);
     thread watchdogThread(StartWatchdog);
+    WriteToLog(L"INFO: All monitoring threads started.");
     processMonitor.detach();
     narratorManager.detach();
     watchdogThread.detach();
@@ -616,21 +683,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClass(&wc);
 
-    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-
     g_hwnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"SecureMediaApp", L"Secure Media Application",
-        WS_POPUP, 0, 0, screenWidth, screenHeight, NULL, NULL, hInstance, NULL);
+        WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, hInstance, NULL);
+
     if (!g_hwnd) {
+        WriteToLog(L"FATAL: Failed to create main window.");
 		CoUninitialize();
 		return -1;
 	}
+    WriteToLog(L"SUCCESS: Main window created.");
 
     ShowWindow(g_hwnd, SW_MAXIMIZE);
     UpdateWindow(g_hwnd);
 
     HWND taskbar = FindWindow(L"Shell_TrayWnd", NULL);
-    if (taskbar) ShowWindow(taskbar, SW_HIDE);
+    if(taskbar) ShowWindow(taskbar, SW_HIDE);
 
     MSG msg = {};
     while (g_running) {
@@ -647,8 +714,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     if (g_passwordEntered) {
-       // RestoreSystemSettings();
+        RestoreSystemSettings();
+    } else {
+        WriteToLog(L"INFO: Application exited without correct password.");
     }
+    WriteToLog(L"INFO: SecureApp shutting down.");
+    WriteToLog(L"=======================================\n");
 
     CoUninitialize();
     return 0;
