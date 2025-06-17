@@ -57,7 +57,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(25565);
-    serverAddr.sin_addr.s_addr = inet_addr("144.24.189.124"); // IP serwera
+    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // IP serwera
 
     // Połączenie z serwerem
     if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) != 0) {
