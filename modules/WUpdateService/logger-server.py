@@ -6,13 +6,14 @@ import signal
 import sys
 from colorama import init, Fore, Style
 
+# Inicjalizacja kolorów
 init(autoreset=True)
 
+# Konfiguracja logowania
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 file_handler = logging.FileHandler('logger-log.txt', encoding='utf-8')
-file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 
@@ -28,21 +29,37 @@ class ColorFormatter(logging.Formatter):
         return f"{color}{super().format(record)}{Style.RESET_ALL}"
 
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
 console_formatter = ColorFormatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(console_formatter)
 
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+# Ustawienia serwera
 HOST = '0.0.0.0'
-PORT = 25565
+PORT = server_port
+PASSWORD = "server_password"
 clients = []
 
+# Obsługa pojedynczego klienta
 def handle_client(client_socket, client_address):
-    logger.info(f"Nowe połączenie od {client_address}")
+    logger.info(f"Połączenie z {client_address}")
     clients.append(client_socket)
+
     try:
+        # Odbiór hasła
+        received = client_socket.recv(1024).decode('utf-8').strip()
+        if received != PASSWORD:
+            logger.warning(f"Odrzucono klienta {client_address}: nieprawidłowe hasło")
+            client_socket.sendall(b"AUTH_FAIL\n")
+            client_socket.close()
+            clients.remove(client_socket)
+            return
+        else:
+            client_socket.sendall(b"AUTH_OK\n")
+            logger.info(f"Klient {client_address} uwierzytelniony")
+
+        # Pętla odbierająca dane
         while True:
             data = client_socket.recv(1024)
             if not data:
@@ -60,6 +77,7 @@ def handle_client(client_socket, client_address):
         client_socket.close()
         logger.info(f"Rozłączono klienta {client_address}")
 
+# Obsługa CTRL+C — wysyłamy DISCONNECT
 def signal_handler(sig, frame):
     logger.info("Zamykanie serwera...")
     for c in clients:
@@ -73,6 +91,7 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
+# Start serwera
 def start_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
